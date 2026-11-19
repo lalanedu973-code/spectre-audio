@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analyseur de spectre audio</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --txt:#e6e9ef; --mut:#8b93a1; --acc:#4fd1c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:16px 20px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  button, select { background:var(--panel); color:var(--txt); border:1px solid #2a303b; border-radius:8px; padding:8px 14px; font-size:14px; cursor:pointer; }
+  button.primary { background:var(--acc); color:#06201d; border:none; font-weight:600; }
+  label { font-size:13px; color:var(--mut); display:flex; gap:6px; align-items:center; }
+  main { padding:0 20px 20px; display:grid; gap:14px; }
+  .card { background:var(--panel); border-radius:12px; padding:12px; position:relative; }
+  .card h2 { font-size:13px; color:var(--mut); margin:0 0 8px; font-weight:500; }
+  canvas { width:100%; display:block; border-radius:8px; background:#0a0d12; }
+  #spectrum { height:320px; } #spectro { height:220px; } #wave { height:110px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .stat { background:var(--panel); border-radius:12px; padding:12px; }
+  .stat .v { font-size:24px; font-weight:600; margin-top:4px; }
+  .stat .k { font-size:12px; color:var(--mut); }
+  #msg { color:var(--mut); font-size:13px; padding:0 20px; }
+  #hover { position:absolute; top:12px; right:14px; font-size:12px; color:var(--acc); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎙️ Analyseur de spectre audio</h1>
+  <div class="controls">
+    <button id="start" class="primary">Démarrer le micro</button>
+    <button id="freeze" disabled>Figer</button>
+    <label>Résolution
+      <select id="fft">
+        <option>1024</option><option>2048</option><option selected>4096</option><option>8192</option><option>16384</option>
+      </select>
+    </label>
+    <label>Échelle
+      <select id="scale"><option value="log" selected>Logarithmique</option><option value="lin">Linéaire</option></select>
+    </label>
+    <label>Lissage <input id="smooth" type="range" min="0" max="0.95" step="0.05" value="0.75"></label>
+    <label><input id="peakhold" type="checkbox" checked> Maintien des pics</label>
+  </div>
+</header>
+<div id="msg">Cliquez sur « Démarrer le micro » et autorisez l'accès quand le navigateur le demande.</div>
+<main>
+  <div class="stats">
+    <div class="stat"><div class="k">Fréquence dominante</div><div class="v" id="peakF">–</div></div>
+    <div class="stat"><div class="k">Note la plus proche</div><div class="v" id="note">–</div></div>
+    <div class="stat"><div class="k">Niveau (dBFS)</div><div class="v" id="level">–</div></div>
+    <div class="stat"><div class="k">Fréquence d'échantillonnage</div><div class="v" id="sr">–</div></div>
+  </div>
+  <div class="card"><h2>Spectre (dB / fréquence)</h2><span id="hover"></span><canvas id="spectrum"></canvas></div>
+  <div class="card"><h2>Spectrogramme (temps / fréquence)</h2><canvas id="spectro"></canvas></div>
+  <div class="card"><h2>Forme d'onde</h2><canvas id="wave"></canvas></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let ctx, analyser, src, stream, freq, timeData, peaks, frozen=false, running=false;
+const MIN_F=20, MIN_DB=-110, MAX_DB=-10;
+const NOTES=['Do','Do#','Ré','Ré#','Mi','Fa','Fa#','Sol','Sol#','La','La#','Si'];
+
+function fit(c){ const r=c.getBoundingClientRect(), d=devicePixelRatio||1; c.width=r.width*d; c.height=r.height*d; }
+const cS=$('spectrum'), cG=$('spectro'), cW=$('wave');
+function resize(){ [cS,cG,cW].forEach(fit); }
+addEventListener('resize', resize); resize();
+
+function xOf(f, w){ const maxF=ctx.sampleRate/2;
+  return $('scale').value==='log' ? Math.log(f/MIN_F)/Math.log(maxF/MIN_F)*w : f/maxF*w; }
+function fOf(x, w){ const maxF=ctx.sampleRate/2;
+  return $('scale').value==='log' ? MIN_F*Math.pow(maxF/MIN_F, x/w) : x/w*maxF; }
+function fmtF(f){ return f>=1000 ? (f/1000).toFixed(2)+' kHz' : f.toFixed(1)+' Hz'; }
+function noteOf(f){ if(f<20) return '–'; const n=Math.round(12*Math.log2(f/440))+57;
+  const cents=Math.round(1200*Math.log2(f/(440*Math.pow(2,(n-57)/12))));
+  return NOTES[((n%12)+12)%12]+Math.floor(n/12)+' '+(cents>=0?'+':'')+cents+'¢'; }
+function color(v){ // v 0..1 -> palette
+  const r=Math.min(255,Math.max(0,255*(1.5*v-0.2))), g=Math.min(255,Math.max(0,255*(1.8*v-0.7))), b=Math.min(255,Math.max(0,255*(v<0.5?v*1.6:1.6-v*1.6)));
+  return `rgb(${r|0},${g|0},${b|0})`; }
+
+function setup(){
+  analyser.fftSize=+$('fft').value;
+  analyser.smoothingTimeConstant=+$('smooth').value;
+  analyser.minDecibels=MIN_DB; analyser.maxDecibels=MAX_DB;
+  freq=new Float32Array(analyser.frequencyBinCount);
+  timeData=new Float32Array(analyser.fftSize);
+  peaks=new Float32Array(analyser.frequencyBinCount).fill(MIN_DB);
+}
+
+$('start').onclick = async () => {
+  if(running){ stream.getTracks().forEach(t=>t.stop()); ctx.close(); running=false;
+    $('start').textContent='Démarrer le micro'; $('freeze').disabled=true; return; }
+  if(!window.isSecureContext || !navigator.mediaDevices){ $('msg').textContent="Ce navigateur bloque le micro ici. Ouvrez le fichier dans Chrome ou Firefox sur ordinateur, ou via une adresse https."; return; }
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  }catch(e){ $('msg').textContent='Accès au micro refusé ou indisponible : '+e.message; return; }
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  if(ctx.state==='suspended') await ctx.resume();
+  analyser=ctx.createAnalyser(); src=ctx.createMediaStreamSource(stream); src.connect(analyser);
+  setup(); running=true; $('sr').textContent=(ctx.sampleRate/1000)+' kHz';
+  $('start').textContent='Arrêter'; $('freeze').disabled=false; $('msg').textContent='Écoute en cours…';
+  requestAnimationFrame(draw);
+};
+$('freeze').onclick = () => { frozen=!frozen; $('freeze').textContent=frozen?'Reprendre':'Figer'; };
+$('fft').onchange = () => analyser && setup();
+$('smooth').oninput = () => analyser && (analyser.smoothingTimeConstant=+$('smooth').value);
+$('scale').onchange = () => peaks && peaks.fill(MIN_DB);
+cS.onmousemove = e => { if(!ctx) return; const r=cS.getBoundingClientRect();
+  const f=fOf(e.clientX-r.left, r.width); const i=Math.round(f/(ctx.sampleRate/analyser.fftSize));
+  $('hover').textContent=fmtF(f)+' · '+(freq[i]??MIN_DB).toFixed(1)+' dB · '+noteOf(f); };
+cS.onmouseleave = () => $('hover').textContent='';
+
+function draw(){
+  if(!running) return;
+  requestAnimationFrame(draw);
+  if(frozen) return;
+  analyser.getFloatFrequencyData(freq); analyser.getFloatTimeDomainData(timeData);
+  const binHz=ctx.sampleRate/analyser.fftSize;
+
+  // Spectrum
+  const g=cS.getContext('2d'), w=cS.width, h=cS.height, d=devicePixelRatio||1;
+  g.clearRect(0,0,w,h);
+  g.font=`${10*d}px system-ui`; g.fillStyle='#5c6573'; g.strokeStyle='#1f2530'; g.lineWidth=1;
+  for(let db=-100; db<=-20; db+=20){ const y=h*(MAX_DB-db)/(MAX_DB-MIN_DB); g.beginPath(); g.moveTo(0,y); g.lineTo(w,y); g.stroke(); g.fillText(db+' dB',4,y-3); }
+  [50,100,200,500,1000,2000,5000,10000,20000].forEach(f=>{ if(f>ctx.sampleRate/2) return; const x=xOf(f,w);
+    g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke(); g.fillText(f>=1000?f/1000+'k':f, x+3, h-4); });
+  const grad=g.createLinearGradient(0,0,0,h); grad.addColorStop(0,'#4fd1c5'); grad.addColorStop(1,'rgba(79,209,197,0.05)');
+  g.beginPath(); g.moveTo(0,h);
+  let maxV=-Infinity, maxI=0;
+  for(let i=1;i<freq.length;i++){ const f=i*binHz; if(f<MIN_F) continue;
+    const v=Math.max(MIN_DB,freq[i]); if(v>maxV){maxV=v;maxI=i;}
+    if($('peakhold').checked) peaks[i]=Math.max(v, peaks[i]-0.4);
+    g.lineTo(xOf(f,w), h*(MAX_DB-v)/(MAX_DB-MIN_DB)); }
+  g.lineTo(w,h); g.closePath(); g.fillStyle=grad; g.fill();
+  if($('peakhold').checked){ g.beginPath(); g.strokeStyle='#f6ad55'; g.lineWidth=d;
+    let first=true; for(let i=1;i<peaks.length;i++){ const f=i*binHz; if(f<MIN_F) continue;
+      const x=xOf(f,w), y=h*(MAX_DB-peaks[i])/(MAX_DB-MIN_DB); first?(g.moveTo(x,y),first=false):g.lineTo(x,y); } g.stroke(); }
+
+  // Parabolic interpolation for dominant frequency
+  let pf=maxI*binHz;
+  if(maxI>0 && maxI<freq.length-1){ const a=freq[maxI-1], b=freq[maxI], c=freq[maxI+1]; const p=0.5*(a-c)/(a-2*b+c); if(isFinite(p)) pf=(maxI+p)*binHz; }
+  if(maxV>-75){ $('peakF').textContent=fmtF(pf); $('note').textContent=noteOf(pf);
+    const x=xOf(pf,w); g.fillStyle='#fff'; g.beginPath(); g.arc(x, h*(MAX_DB-maxV)/(MAX_DB-MIN_DB), 3*d, 0, 7); g.fill(); }
+  else { $('peakF').textContent='–'; $('note').textContent='–'; }
+
+  // Level
+  let s=0; for(const v of timeData) s+=v*v; const rms=Math.sqrt(s/timeData.length);
+  $('level').textContent=(rms>0?(20*Math.log10(rms)).toFixed(1):'-∞');
+
+  // Spectrogram (scroll left)
+  const sg=cG.getContext('2d'), W=cG.width, H=cG.height;
+  sg.drawImage(cG, -2, 0);
+  for(let y=0;y<H;y++){ const f=fOf(H-y, H); const i=Math.min(freq.length-1, Math.round(f/binHz));
+    const v=(Math.max(MIN_DB,freq[i])-MIN_DB)/(MAX_DB-MIN_DB); sg.fillStyle=color(Math.min(1,Math.max(0,v))); sg.fillRect(W-2,y,2,1); }
+
+  // Waveform
+  const wg=cW.getContext('2d'), ww=cW.width, wh=cW.height;
+  wg.clearRect(0,0,ww,wh); wg.strokeStyle='#90cdf4'; wg.lineWidth=d; wg.beginPath();
+  for(let i=0;i<timeData.length;i++){ const x=i/timeData.length*ww, y=wh/2*(1-timeData[i]); i?wg.lineTo(x,y):wg.moveTo(x,y); }
+  wg.stroke();
+}
+</script>
+</body>
+</html>
